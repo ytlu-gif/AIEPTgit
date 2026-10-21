@@ -1,0 +1,28 @@
+Windows 打包步驟
+================
+
+1. 開啟 PowerShell，切換到 AIEPTgit 專案資料夾：
+   Set-Location "<AIEPTgit 專案資料夾路徑>"
+
+2. 建議建立虛擬環境並安裝需求套件：
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install -r requirements.txt
+
+3. 建立可攜式程式資料夾：
+   python -m PyInstaller --noconfirm --clean --onedir --windowed --collect-all sounddevice --icon=app_icon.ico --name "AIEPT" app.py
+
+4. 打包完成後，先測試：
+   .\dist\AIEPT\AIEPT.exe
+
+   發行可攜式版本時，請完整提供 dist\AIEPT 資料夾，
+   不要只複製 EXE，因為執行所需的套件與資源也在該資料夾中。
+
+5. 若要建立安裝程式，請先完成並測試第 3、4 步，再用 Inno Setup 開啟
+   AIEPT.iss，按 Compile（或 F9）。
+   安裝程式會輸出到專案資料夾，檔名為 AIEPT_Setup_v2.7.exe。
+
+注意：
+- 請在專案根目錄執行打包指令，確保 app_icon.ico 能被找到。
+- 更新程式後，重新執行 PyInstaller；安裝包只會包含當次 dist 內的版本。
+- 發行前請在另一台 Windows 電腦測試，並確認網路、麥克風權限及 API Key 設定。

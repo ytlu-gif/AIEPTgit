@@ -1,0 +1,47 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# PyInstaller build output
+/build/
+/dist/
+/dist_with_deps/
+
+# Private settings and conversation history (at any depth)
+config.json
+chat_history.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Generated learning materials and audio
+*.docx
+*.mp3
+*.wav
+
+# Installers, archives, and local logs
+*.exe
+*.msi
+*.zip
+*.7z
+*.log
+
+# Local editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

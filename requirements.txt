@@ -1,0 +1,7 @@
+aiohttp
+edge-tts
+Pillow
+python-docx
+PyInstaller
+requests
+sounddevice
