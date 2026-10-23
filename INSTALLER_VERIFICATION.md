@@ -4,7 +4,7 @@
 
 ## 舊安裝包
 
-舊版 `AIEPT_Setup_v2.7.exe` 解包後確認含有 `config.json`，其中存在非空 API Key 設定值。不得散發。舊檔保留在已被 Git 忽略的 `build/installer-audit/AIEPT_Setup_v2.7.before-cleanup.exe`。本紀錄不包含金鑰值；如舊檔曾對外提供，請撤銷相關金鑰並換新。
+舊版 `AIEPT_Setup_v2.7.exe` 解包後確認含有 `config.json`，其中存在非空 API Key 設定值。不得散發。舊安裝包備份已依專案擁有者要求刪除，不再保留。本紀錄不包含金鑰值；如舊檔曾對外提供，請撤銷相關金鑰並換新。
 
 ## 重建與驗證
 
