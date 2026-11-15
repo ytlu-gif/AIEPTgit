@@ -45,3 +45,8 @@ chat_history.json
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Private sentence timing sidecars contain learning text
+*.timings.json
+*.timings.json.partial
+.aiept-update-*.tmp

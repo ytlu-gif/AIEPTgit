@@ -12,6 +12,13 @@ import re
 import wave
 import uuid
 import zipfile
+import math
+import struct
+from audio_tempo import AudioTempoCache
+import local_whisper
+import read_along
+import update_checker
+import webbrowser
 from datetime import datetime
 import aiohttp
 import requests
@@ -27,12 +34,32 @@ from docx.oxml import parse_xml, OxmlElement
 from docx.oxml.ns import nsdecls, qn
 from docx.opc.exceptions import PackageNotFoundError
 from docx.text.paragraph import Paragraph
-import edge_tts
 from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+# edge_tts 延迟导入，避免打包环境 ssl locale 问题
+edge_tts = None
+
+def _get_edge_tts():
+    global edge_tts
+    if edge_tts is None:
+        import locale
+        for loc in ("zh_TW.UTF-8", "C.UTF-8", "en_US.UTF-8", "C"):
+            try:
+                locale.setlocale(locale.LC_ALL, loc)
+                break
+            except (locale.Error, TypeError):
+                continue
+        os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+        os.environ.setdefault("LC_ALL", "zh_TW.UTF-8")
+        os.environ.setdefault("LANG", "zh_TW.UTF-8")
+        import edge_tts as _et
+        edge_tts = _et
+    return edge_tts
 
 CONFIG_FILE = "config.json"
 CHAT_HISTORY_FILE = "chat_history.json"
 APP_TITLE = "AI互動式英語練習工具"
+APP_VERSION = "2.9.3"
 APP_COLORS = {
     "background": "#F2F6FA",
     "surface": "#FFFFFF",
@@ -44,14 +71,93 @@ APP_COLORS = {
     "border": "#D4E0E8",
 }
 AI_PROVIDERS = {
+    "Ollama": "AIEPT_OLLAMA_UNUSED_KEY",
     "Gemini": "GEMINI_API_KEY",
     "OpenAI": "OPENAI_API_KEY",
     "Claude": "ANTHROPIC_API_KEY",
+    "HuggingFace": "HUGGINGFACE_API_KEY",
+    "Cohere": "COHERE_API_KEY",
+    "Together": "TOGETHER_API_KEY",
+    "Groq": "GROQ_API_KEY",
+    "OpenRouter": "OPENROUTER_API_KEY",
 }
+SPEECH_RATES = {"0.5 倍（很慢）": -50, "0.75 倍（慢速）": -25, "1.0 倍（正常）": 0, "1.25 倍（快速）": 25, "1.5 倍（很快）": 50}
+
+ARTICLE_LENGTHS = {
+    "短篇（100–150字）": (100, 150, 2, 6144),
+    "中篇（200–300字）": (200, 300, 3, 7168),
+    "長篇（500–700字）": (500, 700, 5, 10240),
+}
+DEFAULT_ARTICLE_LENGTH = "中篇（200–300字）"
+
 GEMINI_MODEL = "gemini-3.8-flash"
 
+OLLAMA_MODEL = "qwen3:4b"
+OLLAMA_URL = "http://127.0.0.1:11434"
+SERVICE_GROUPS = {
+    "本機 AI（免 API Key）": ("Ollama",),
+    "雲端免費額度（需 Key）": ("OpenRouter",),
+    "雲端付費／依帳戶計費（需 Key）": tuple(p for p in AI_PROVIDERS if p != "Ollama"),
+}
+SERVICE_NOTES = {
+    "本機 AI（免 API Key）": "Qwen3 4B・免 Key、不轉雲端；朗讀使用 Windows 本機語音。先執行 ollama pull qwen3:4b。",
+    "雲端免費額度（需 Key）": "OpenRouter 僅使用 openrouter/free；額度用完即停止，不切換付費模型。",
+    "雲端付費／依帳戶計費（需 Key）": "費用依模型與帳戶方案；Gemini、Groq 等可能有免費額度，本程式無法確認帳戶計費狀態。",
+}
 
-def build_learning_prompt(topic, keywords, scenario):
+# 各服务的默认模型
+PROVIDER_MODELS = {
+    "HuggingFace": "meta-llama/Llama-3.2-3B-Instruct",
+    "Cohere": "command-r",
+    "Together": "meta-llama/Llama-3.2-3B-Instruct",
+    "Groq": "llama-3.2-3b-versatile",
+    "OpenRouter": "openrouter/free",
+}
+
+
+def _object_schema(properties):
+    return {"type": "object", "properties": properties, "required": list(properties)}
+
+_TEXT = {"type": "string", "minLength": 1}
+_TEXTS = {"type": "array", "items": _TEXT, "minItems": 1}
+_BILINGUAL = _object_schema({"en": _TEXT, "zh": _TEXT})
+_WORD_SCHEMA = _object_schema({
+    "word": _TEXT, "kk": _TEXT,
+    "pos": {"type": "array", "minItems": 1, "items": _object_schema({"pos": _TEXT, "zh": _TEXT})},
+    "forms": _TEXT, "usage": _TEXT,
+    "examples": {"type": "array", "minItems": 1, "items": _BILINGUAL},
+    "synonyms": _TEXTS, "collocations": _TEXTS,
+    "listening": {"type": "array", "minItems": 1, "items": _BILINGUAL},
+})
+LOCAL_CARD_SCHEMA = _object_schema({
+    "title": _TEXT, "title_zh": _TEXT,
+    "article": _object_schema({"en": _TEXTS, "zh": _TEXTS}),
+    "words": {"type": "array", "minItems": 1, "items": _WORD_SCHEMA},
+})
+
+def validate_local_card(card, keyword_count):
+    def check(value, schema, path):
+        kind = schema["type"]
+        valid = (isinstance(value, dict) if kind == "object" else
+                 isinstance(value, list) if kind == "array" else
+                 isinstance(value, str) and bool(value.strip()))
+        if not valid:
+            raise ValueError(f"本機模型回傳的教材欄位 {path} 格式不完整。這不表示關鍵字超量；請重新生成，或分批輸入關鍵字。")
+        if kind == "object":
+            for key, child in schema["properties"].items():
+                check(value.get(key), child, path + "." + key)
+        elif kind == "array":
+            if len(value) < schema.get("minItems", 0):
+                raise ValueError(f"本機教材欄位 {path} 不可為空。")
+            for i, item in enumerate(value):
+                check(item, schema["items"], f"{path}[{i}]")
+    check(card, LOCAL_CARD_SCHEMA, "教材")
+    if len(card["words"]) != keyword_count:
+        raise ValueError(f"你輸入 {keyword_count} 個關鍵字，但本機模型回傳 {len(card['words'])} 個詞條。請重新生成或分批輸入；這不是程式的關鍵字數量限制。")
+
+
+def build_learning_prompt(topic, keywords, scenario, article_length=DEFAULT_ARTICLE_LENGTH):
+    minimum, maximum, paragraphs, _ = ARTICLE_LENGTHS.get(article_length, ARTICLE_LENGTHS[DEFAULT_ARTICLE_LENGTH])
     keyword_list = ", ".join(keywords)
     return f"""
 你是一位專業的英語教學專家。請針對「{scenario}」情境、主題「{topic}」以及目標關鍵字「{keyword_list}」，製作結構化英語學習卡內容。
@@ -95,7 +201,7 @@ def build_learning_prompt(topic, keywords, scenario):
 }}
 
 要求：
-1. 文章 (article.en) 全文長度必須介於 200～300 字之間，分成 3 段。
+1. 英文文章 (article.en) 目標長度為 {minimum}～{maximum} 個英文單字，分成 {paragraphs} 段；中文翻譯需逐段對應。JSON 中的段落數僅為格式範例，請依本項要求輸出。
 2. 文章以「{scenario}」為背景，適合一般英語學習者，內容自然且符合該情境，並完整包含每個關鍵字所對應的英文單字或片語。
 3. words 陣列須為每個輸入關鍵字各提供一筆精解；「word」一律使用對應的英文單字或片語，不可將片語拆開；每筆都必須提供正確的美式 KK 音標符號（不含方括號），而非 IPA，片語須逐詞標註。
 4. 輸出必須為標準可被 json.loads 解析的純 JSON 字串。
@@ -214,7 +320,7 @@ class AppLogger:
 class FlashcardApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(APP_TITLE)
+        self.root.title(f"{APP_TITLE} v{APP_VERSION}")
         self.root.geometry("980x900")
         self.root.minsize(760, 700)
         self.root.resizable(True, True)
@@ -223,14 +329,33 @@ class FlashcardApp:
 
         # 載入本機設定
         self.config = self.load_config()
+        self.auto_updates_var = tk.BooleanVar(value=self.config.get("check_updates", True))
+        self.update_check_running = False
+        saved_rate = self.config.get("speech_rate", "1.0 倍（正常）")
+        self.speech_rate_var = tk.StringVar(value=saved_rate if saved_rate in SPEECH_RATES else "1.0 倍（正常）")
+        self.playback_rate_var = tk.StringVar(value="1.0 倍（正常）")
+        self.audio_tempo_cache = None
+        self.audio_speed_factor = 1.0
+        self.audio_rate_token = 0
+        self.audio_rate_pending = False
+        self.read_along_text = ""
+        self.read_along_ranges = []
+        self.read_along_active = -1
+        self.read_along_var = tk.BooleanVar(value=True)
+        self.read_along_mode_var = tk.StringVar(value="跟讀：播放後顯示")
+        selected_length = self.config.get("article_length", DEFAULT_ARTICLE_LENGTH)
+        self.article_length_var = tk.StringVar(value=selected_length if selected_length in ARTICLE_LENGTHS else DEFAULT_ARTICLE_LENGTH)
+        self.microphone_var = tk.StringVar(value=self.config.get("microphone", "系統預設麥克風"))
+        self.speech_language_var = tk.StringVar(value=self.config.get("speech_language", "英文"))
         self.unsaved_api_keys = {}
         self.settings_unsaved_api_keys = {}
-        self.current_provider = "Gemini"
+        self.current_provider = "Ollama"
+        self.service_mode_var = tk.StringVar(value=next(iter(SERVICE_GROUPS)))
         self.speech_provider_var = tk.StringVar(
-            value=self.config.get("speech_provider", "Windows 本機")
+            value=self.config.get("speech_provider", "Whisper 本機")
         )
         if self.speech_provider_var.get() not in (
-            "Windows 本機",
+            "Whisper 本機", "Windows 本機",
             "Gemini 雲端",
             "OpenAI 雲端",
         ):
@@ -289,6 +414,8 @@ class FlashcardApp:
 
     def save_config(self, api_key, provider=None):
         provider = provider or self.provider_combo.get()
+        if provider == "Ollama":
+            return True
         updated_config = dict(self.config)
         api_keys = dict(updated_config.get("api_keys", {}))
         api_keys[provider] = api_key
@@ -361,6 +488,8 @@ class FlashcardApp:
                 messagebox.showerror("失敗", "刪除設定檔時發生錯誤。")
 
     def get_provider_api_key(self, provider):
+        if provider == "Ollama":
+            return ""
         api_keys = self.config.get("api_keys", {})
         configured_key = api_keys.get(provider, "")
         if provider == "Gemini":
@@ -371,6 +500,7 @@ class FlashcardApp:
         if event is not None and event.widget is not self.provider_combo:
             return
         current_key = self.api_key_entry.get().strip()
+        self.api_key_entry.configure(state="normal")
         configured_key = self.config.get("api_keys", {}).get(self.current_provider, "")
         if self.current_provider == "Gemini":
             configured_key = configured_key or self.config.get("api_key", "")
@@ -386,6 +516,8 @@ class FlashcardApp:
         self.api_key_entry.delete(0, tk.END)
         if api_key:
             self.api_key_entry.insert(0, api_key)
+        if self.current_provider == "Ollama":
+            self.api_key_entry.configure(state="disabled")
 
     def setup_app_icon(self):
         """動態繪製並設定專屬應用程式 Logo 圖示"""
@@ -495,6 +627,8 @@ class FlashcardApp:
         help_menu = tk.Menu(menu_bar, tearoff=False)
         help_menu.add_command(label="使用說明", command=self.open_usage_window)
         help_menu.add_command(label="版權資訊", command=self.open_copyright_window)
+        help_menu.add_separator()
+        help_menu.add_command(label="檢查更新…", command=lambda: self.check_for_updates(manual=True))
         menu_bar.add_cascade(label="說明", menu=help_menu)
         self.root.config(menu=menu_bar)
 
@@ -528,51 +662,72 @@ class FlashcardApp:
         )
         param_frame.pack(fill=tk.X, padx=15, pady=10)
 
+        ttk.Label(param_frame, text="使用方式:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        mode_frame = ttk.Frame(param_frame)
+        mode_frame.grid(row=0, column=1, columnspan=2, sticky=tk.EW)
+        mode_combo = ttk.Combobox(mode_frame, textvariable=self.service_mode_var,
+                                 values=list(SERVICE_GROUPS), state="readonly", width=39)
+        mode_combo.pack(side=tk.LEFT)
+        mode_combo.bind("<<ComboboxSelected>>", self.on_service_mode_change)
+        self.ollama_check_button = ttk.Button(mode_frame, text="檢查本機模型", command=self.check_ollama)
+        self.ollama_check_button.pack(side=tk.LEFT, padx=6)
+        self.service_note = ttk.Label(param_frame, text=SERVICE_NOTES[self.service_mode_var.get()], wraplength=720)
+        self.service_note.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=4)
         # API Key 欄位區（搭配儲存與刪除按鈕）
-        ttk.Label(param_frame, text="AI 服務:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Label(param_frame, text="AI 服務:").grid(row=2, column=0, sticky=tk.W, pady=5)
         self.provider_combo = ttk.Combobox(
-            param_frame, width=47, state="readonly", values=list(AI_PROVIDERS)
+            param_frame, width=47, state="readonly", values=SERVICE_GROUPS[self.service_mode_var.get()]
         )
         self.provider_combo.set(self.current_provider)
-        self.provider_combo.grid(row=0, column=1, columnspan=2, sticky=tk.W, pady=5)
+        self.provider_combo.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=5)
         self.provider_combo.bind("<<ComboboxSelected>>", self.on_provider_change)
 
-        ttk.Label(param_frame, text="API Key:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Label(param_frame, text="API Key:").grid(row=3, column=0, sticky=tk.W, pady=5)
 
         self.api_key_entry = ttk.Entry(param_frame, width=36, show="*")
-        self.api_key_entry.grid(row=1, column=1, sticky=tk.W, pady=5, padx=(0, 5))
+        self.api_key_entry.grid(row=3, column=1, sticky=tk.W, pady=5, padx=(0, 5))
 
         saved_key = self.get_provider_api_key(self.current_provider)
         if saved_key:
             self.api_key_entry.insert(0, saved_key)
+        if self.current_provider == "Ollama":
+            self.api_key_entry.configure(state="disabled")
 
-        ttk.Label(param_frame, text="學習情境:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Label(param_frame, text="學習情境:").grid(row=4, column=0, sticky=tk.W, pady=5)
         self.scenario_combo = ttk.Combobox(
             param_frame, width=47, state="readonly",
             values=("商業", "學術", "日常生活", "旅遊", "職場溝通", "綜合")
         )
         self.scenario_combo.set("商業")
-        self.scenario_combo.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=5)
+        self.scenario_combo.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=5)
 
         # 主題
-        ttk.Label(param_frame, text="學習單元主題:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(param_frame, text="學習單元主題:").grid(row=5, column=0, sticky=tk.W, pady=5)
         self.topic_entry = ttk.Entry(param_frame, width=50)
-        self.topic_entry.grid(row=3, column=1, columnspan=2, sticky=tk.W, pady=5)
+        self.topic_entry.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=5)
         self.topic_entry.insert(0, "Workplace Communication")
+
+        ttk.Label(param_frame, text="文章長度：").grid(row=7, column=0, sticky=tk.W, pady=5)
+        self.article_length_combo = ttk.Combobox(
+            param_frame, textvariable=self.article_length_var,
+            values=list(ARTICLE_LENGTHS), state="readonly", width=28,
+        )
+        self.article_length_combo.grid(row=7, column=1, sticky=tk.W, pady=5)
+        ttk.Label(param_frame, text="英文單字數；長文生成較久").grid(row=7, column=2, sticky=tk.W)
 
         # 目標單字或片語
         ttk.Label(
             param_frame, text="關鍵字（中文／英文，逗號分隔）:"
-        ).grid(row=4, column=0, sticky=tk.W, pady=5)
+        ).grid(row=6, column=0, sticky=tk.W, pady=5)
         self.words_entry = ttk.Entry(param_frame, width=38)
-        self.words_entry.grid(row=4, column=1, sticky=tk.W, pady=5)
+        self.words_entry.grid(row=6, column=1, sticky=tk.W, pady=5)
         self.words_entry.insert(0, "schedule, follow up, deadline")
         self.speech_btn = ttk.Button(
             param_frame,
             text="🎙 語音輸入",
             command=self.start_speech_input,
         )
-        self.speech_btn.grid(row=4, column=2, sticky=tk.W, padx=2, pady=5)
+        self.speech_btn.grid(row=6, column=2, sticky=tk.W, padx=2, pady=5)
 
         # 操作按鈕
         btn_frame = ttk.Frame(self.root, padding=(15, 4), style="App.TFrame")
@@ -707,12 +862,39 @@ class FlashcardApp:
             style="Secondary.TButton",
         )
         self.stop_audio_btn.pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Label(audio_controls, text="播放速度：").pack(side=tk.LEFT)
+        self.playback_rate_combo = ttk.Combobox(
+            audio_controls, textvariable=self.playback_rate_var,
+            values=list(SPEECH_RATES), state="readonly", width=17,
+        )
+        self.playback_rate_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.playback_rate_combo.bind("<<ComboboxSelected>>", self.change_playback_rate)
         self.audio_status_var = tk.StringVar(value="尚無語音檔")
         ttk.Label(
             audio_controls,
             textvariable=self.audio_status_var,
             foreground=APP_COLORS["muted"],
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.audio_duration_ms = 0
+        self.audio_progress_var = tk.DoubleVar(value=0)
+        self.audio_time_var = tk.StringVar(value="00:00 / 00:00")
+        timeline = ttk.Frame(preview_frame, style="App.TFrame")
+        timeline.grid(row=3, column=0, columnspan=2, sticky=tk.EW, pady=(4, 0))
+        timeline.columnconfigure(0, weight=1)
+        self.audio_progress = ttk.Progressbar(
+            timeline, variable=self.audio_progress_var, maximum=1,
+            mode="determinate",
+        )
+        self.audio_progress.grid(row=0, column=0, sticky=tk.EW)
+        ttk.Label(timeline, textvariable=self.audio_time_var).grid(
+            row=0, column=1, padx=(10, 0)
+        )
+
+        self.card_preview_text.tag_configure("read-along", background="#FFF176", foreground="#173B57")
+        ttk.Checkbutton(timeline, text="螢光跟讀", variable=self.read_along_var,
+                        command=self.toggle_read_along).grid(row=1, column=0, sticky=tk.W, pady=(3, 0))
+        ttk.Label(timeline, textvariable=self.read_along_mode_var).grid(row=1, column=1, sticky=tk.E)
 
         # 處理進度記錄
         log_frame = ttk.LabelFrame(
@@ -794,7 +976,7 @@ class FlashcardApp:
         ttk.Label(
             content, text="AI互動式英語練習工具", font=("Microsoft JhengHei", 15, "bold")
         ).pack(anchor=tk.W, pady=(0, 14))
-        ttk.Label(content, text="版本：2.7.0", font=("Microsoft JhengHei", 10)).pack(
+        ttk.Label(content, text=f"版本：{APP_VERSION}", font=("Microsoft JhengHei", 10)).pack(
             anchor=tk.W, pady=4
         )
         ttk.Label(
@@ -990,7 +1172,7 @@ class FlashcardApp:
         window = tk.Toplevel(self.root)
         self.settings_window = window
         window.title("偏好設定")
-        window.geometry("560x470")
+        window.geometry("940x600")
         window.resizable(False, False)
         window.transient(self.root)
         window.protocol("WM_DELETE_WINDOW", window.destroy)
@@ -999,7 +1181,11 @@ class FlashcardApp:
         frame.pack(fill=tk.BOTH, expand=True)
         frame.columnconfigure(1, weight=1)
         self.settings_speech_var = tk.StringVar(value=self.speech_provider_var.get())
+        self.settings_updates_var = tk.BooleanVar(value=self.auto_updates_var.get())
+        ttk.Checkbutton(frame, text="啟動時檢查 GitHub 正式版本更新（每天最多一次；不傳送教材、錄音或 API Key）",
+                        variable=self.settings_updates_var).grid(row=11, column=0, columnspan=3, sticky=tk.W, pady=7)
         self.settings_voice_var = tk.StringVar(value=self.voice_var.get())
+        self.settings_rate_var = tk.StringVar(value=self.speech_rate_var.get())
         self.settings_output_dir_var = tk.StringVar(value=self.output_dir_var.get())
 
         ttk.Label(frame, text="語音辨識方式：").grid(
@@ -1008,13 +1194,34 @@ class FlashcardApp:
         self.settings_speech_combo = ttk.Combobox(
             frame,
             textvariable=self.settings_speech_var,
-            values=("Windows 本機", "Gemini 雲端", "OpenAI 雲端"),
+            values=("Whisper 本機", "Windows 本機", "Gemini 雲端", "OpenAI 雲端"),
             state="readonly",
             width=38,
         )
         self.settings_speech_combo.grid(
             row=0, column=1, sticky=tk.EW, pady=7
         )
+
+        self.whisper_setup_btn = ttk.Button(frame, text="下載／檢查 Whisper", command=self.setup_local_whisper)
+        self.whisper_setup_btn.grid(row=0, column=2, padx=(10, 0))
+        ttk.Label(frame, text="關鍵字語音語言：").grid(row=10, column=0, sticky=tk.W, pady=7)
+        self.settings_language_var = tk.StringVar(value=self.speech_language_var.get())
+        ttk.Combobox(frame, textvariable=self.settings_language_var, values=("英文", "繁體中文"),
+                     state="readonly", width=20).grid(row=10, column=1, sticky=tk.W)
+        ttk.Label(frame, text="錄音裝置：").grid(row=8, column=0, sticky=tk.W, pady=7)
+        self.settings_microphone_var = tk.StringVar(value=self.microphone_var.get())
+        devices = ["系統預設麥克風"]
+        try:
+            import sounddevice
+            devices += [f"{i}: {d['name']}" for i, d in enumerate(sounddevice.query_devices()) if d['max_input_channels'] > 0]
+        except (ImportError, OSError, RuntimeError):
+            pass
+        if self.settings_microphone_var.get() not in devices:
+            self.settings_microphone_var.set(devices[0])
+        ttk.Combobox(frame, textvariable=self.settings_microphone_var, values=devices,
+                     state="readonly", width=48).grid(row=8, column=1, sticky=tk.EW)
+        ttk.Label(frame, text="本機建議選 Whisper；首次需下載約 150 MB。錄音時顯示收音音量；辨識後可編輯再送出。").grid(
+            row=9, column=0, columnspan=3, sticky=tk.W, pady=7)
 
         ttk.Label(frame, text="語音朗讀發音人：").grid(
             row=1, column=0, sticky=tk.W, pady=7
@@ -1034,6 +1241,12 @@ class FlashcardApp:
         if self.settings_voice_var.get() not in self.settings_voice_combo["values"]:
             self.settings_voice_var.set("en-US-JennyNeural (美式女聲)")
         self.settings_voice_combo.grid(row=1, column=1, sticky=tk.EW, pady=7)
+        rate_frame = ttk.Frame(frame)
+        rate_frame.grid(row=1, column=2, sticky=tk.W, padx=(12, 0))
+        ttk.Label(rate_frame, text="生成音檔的朗讀速度：").pack(anchor=tk.W)
+        ttk.Combobox(rate_frame, textvariable=self.settings_rate_var,
+                     values=list(SPEECH_RATES), state="readonly", width=19).pack(anchor=tk.W)
+        ttk.Label(rate_frame, text="套用到新產生的音檔；\n播放時可在播放器另選速度。").pack(anchor=tk.W)
 
         ttk.Label(frame, text="輸出資料夾：").grid(
             row=2, column=0, sticky=tk.W, pady=7
@@ -1059,11 +1272,11 @@ class FlashcardApp:
         )
         self.settings_provider_combo = ttk.Combobox(
             frame,
-            values=list(AI_PROVIDERS),
+            values=[p for p in AI_PROVIDERS if p != "Ollama"],
             state="readonly",
             width=38,
         )
-        self.settings_provider_combo.set(self.current_provider)
+        self.settings_provider_combo.set(self.current_provider if self.current_provider != "Ollama" else "OpenRouter")
         self.settings_provider_combo.grid(
             row=5, column=1, sticky=tk.EW, pady=7
         )
@@ -1077,13 +1290,14 @@ class FlashcardApp:
         self.settings_key_entry = ttk.Entry(frame, show="*", width=40)
         self.settings_key_entry.grid(row=6, column=1, sticky=tk.EW, pady=7)
         current_key = self.api_key_entry.get().strip()
+        self.api_key_entry.configure(state="normal")
         configured_key = self.config.get("api_keys", {}).get(self.current_provider, "")
         if self.current_provider == "Gemini":
             configured_key = configured_key or self.config.get("api_key", "")
         environment_key = os.getenv(AI_PROVIDERS[self.current_provider], "")
         if current_key and current_key not in (configured_key, environment_key):
             self.settings_unsaved_api_keys[self.current_provider] = current_key
-        self.load_settings_api_key(self.current_provider)
+        self.load_settings_api_key(self.settings_provider_combo.get())
 
         api_buttons = ttk.Frame(frame)
         api_buttons.grid(row=7, column=1, sticky=tk.W, pady=(0, 8))
@@ -1150,7 +1364,11 @@ class FlashcardApp:
             return
         updated_config = dict(self.config)
         updated_config["speech_provider"] = self.settings_speech_var.get()
+        updated_config["check_updates"] = self.settings_updates_var.get()
+        updated_config["microphone"] = self.settings_microphone_var.get()
+        updated_config["speech_language"] = self.settings_language_var.get()
         updated_config["voice"] = self.settings_voice_var.get()
+        updated_config["speech_rate"] = self.settings_rate_var.get()
         updated_config["output_dir"] = output_dir
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as config_file:
@@ -1164,21 +1382,136 @@ class FlashcardApp:
             return
         self.config = updated_config
         self.speech_provider_var.set(self.settings_speech_var.get())
+        self.auto_updates_var.set(self.settings_updates_var.get())
+        self.microphone_var.set(self.settings_microphone_var.get())
+        self.speech_language_var.set(self.settings_language_var.get())
         self.voice_var.set(self.settings_voice_var.get())
+        self.speech_rate_var.set(self.settings_rate_var.get())
         self.output_dir_var.set(output_dir)
         messagebox.showinfo(
             "設定完成", "偏好設定已儲存。", parent=self.settings_window
         )
 
+    def persist_update_state(self, **changes):
+        self.config.update(changes)
+        partial = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                    dir=os.path.dirname(os.path.abspath(CONFIG_FILE)), prefix=".aiept-update-", suffix=".tmp", delete=False) as output:
+                partial = output.name
+                json.dump(self.config, output, ensure_ascii=False, indent=2)
+            os.replace(partial, CONFIG_FILE)
+        except OSError as error:
+            self.logger.log(f"更新檢查設定無法保存：{error}")
+        finally:
+            if partial and os.path.exists(partial):
+                os.remove(partial)
+
+    def check_for_updates(self, manual=False):
+        if self.update_check_running:
+            if manual:
+                messagebox.showinfo("檢查更新", "正在檢查，請稍候。")
+            return
+        now = time.time()
+        if not manual and not update_checker.should_check(
+                self.auto_updates_var.get(), self.config.get("last_update_check"), now):
+            return
+        self.update_check_running = True
+        self.persist_update_state(last_update_check=now)
+        def worker():
+            result, error = None, None
+            try:
+                result = update_checker.check_latest(APP_VERSION)
+            except Exception as exc:
+                error = str(exc)
+            try:
+                self.root.after(0, lambda: self.finish_update_check(result, error, manual))
+            except RuntimeError:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_update_check(self, result, error, manual):
+        self.update_check_running = False
+        if error:
+            if manual:
+                messagebox.showinfo("暫時無法檢查更新", error)
+            return
+        if result["status"] == "available":
+            tag = result["tag"]
+            if not manual and self.config.get("notified_update_tag") == tag:
+                return
+            self.persist_update_state(notified_update_tag=tag)
+            if messagebox.askyesno("AIEPT 有新版本", f"目前版本：v{APP_VERSION}\n最新正式版本：{tag}\n\n是否開啟 GitHub 發行頁查看與下載？更新不會自動安裝。"):
+                webbrowser.open(result["url"])
+        elif manual:
+            messagebox.showinfo("檢查更新", "目前尚無正式 Release。" if result["status"] == "no_release"
+                                else f"目前 v{APP_VERSION} 已是最新可用版本。")
+
+    def setup_local_whisper(self):
+        if local_whisper.ready():
+            messagebox.showinfo("Whisper 已就緒", "本機模型已下載，可離線辨識中英文。")
+            return
+        if not messagebox.askyesno("下載 Whisper 本機模型", "將從 Whisper 官方專案與模型來源下載約 150 MB 到本機。下載後錄音不會上傳雲端。是否下載？"):
+            return
+        if getattr(self, "whisper_downloading", False):
+            return
+        self.whisper_downloading = True
+        def status(text):
+            self.root.after(0, lambda t=text: self.whisper_setup_btn.config(text=t)
+                            if hasattr(self, "whisper_setup_btn") and self.whisper_setup_btn.winfo_exists() else None)
+        def finished(error):
+            self.whisper_downloading = False
+            if hasattr(self, "whisper_setup_btn") and self.whisper_setup_btn.winfo_exists():
+                self.whisper_setup_btn.config(text="下載／檢查 Whisper")
+            if error:
+                messagebox.showerror("Whisper 下載失敗", error)
+            else:
+                self.speech_provider_var.set("Whisper 本機")
+                if hasattr(self, "settings_speech_var"):
+                    self.settings_speech_var.set("Whisper 本機")
+                messagebox.showinfo("Whisper 已就緒", "下載完成。請保存偏好設定，再按語音輸入開始錄音。")
+        def worker():
+            error = None
+            try:
+                local_whisper.install(status=status)
+            except Exception as exc:
+                error = str(exc)
+            try:
+                self.root.after(0, lambda e=error: finished(e))
+            except RuntimeError:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
     def start_speech_input(
-        self, target_entry=None, button=None, language="zh-TW"
+        self, target_entry=None, button=None, language=None
     ):
         target_entry = target_entry or self.words_entry
+        language = language or ("en-US" if self.speech_language_var.get() == "英文" else "zh-TW")
         button = button or self.speech_btn
+        if self.active_speech_button:
+            messagebox.showinfo("錄音進行中", "請先停止目前的錄音。")
+            return
+        # Avoid transcribing the app's own lesson audio through the laptop microphone.
+        if self.audio_device_alias:
+            self.pause_generated_audio()
         self.speech_input_target = target_entry
         self.active_speech_button = button
         self.speech_button_default_text = button.cget("text")
         speech_provider = self.speech_provider_var.get()
+        if self.provider_combo.get() == "Ollama" and speech_provider not in ("Whisper 本機", "Windows 本機"):
+            speech_provider = "Whisper 本機"
+        self.active_microphone = self.microphone_var.get()
+        if speech_provider == "Whisper 本機":
+            if not local_whisper.ready():
+                self.speech_input_target = None
+                self.active_speech_button = None
+                self.setup_local_whisper()
+                return
+            self.speech_recording_event = threading.Event()
+            button.config(state=tk.NORMAL, text="■ 停止錄音", command=self.stop_cloud_speech_recording)
+            threading.Thread(target=self.run_cloud_speech_recognition,
+                args=(self.speech_recording_event, "Whisper", "", language), daemon=True).start()
+            return
         if speech_provider == "Windows 本機":
             if sys.platform != "win32":
                 messagebox.showerror(
@@ -1205,7 +1538,7 @@ class FlashcardApp:
         if self.provider_combo.get() == provider:
             api_key = self.api_key_entry.get().strip()
         api_key = api_key or self.get_provider_api_key(provider)
-        if not api_key:
+        if provider != "Ollama" and not api_key:
             messagebox.showwarning(
                 "缺少 API Key",
                 f"請先在「AI 服務」選擇 {provider} 並設定 API Key，"
@@ -1342,7 +1675,11 @@ catch {
             sample_rate = 16000
             block_size = 4000
             audio_chunks = []
+            microphone = getattr(self, "active_microphone", "系統預設麥克風")
+            device = int(microphone.split(":", 1)[0]) if ":" in microphone else None
+            overflowed = False
             with sounddevice.RawInputStream(
+                device=device,
                 samplerate=sample_rate,
                 channels=1,
                 dtype="int16",
@@ -1351,8 +1688,15 @@ catch {
                 for _ in range(120):
                     if stop_event.is_set():
                         break
-                    audio_data, _ = stream.read(block_size)
-                    audio_chunks.append(bytes(audio_data))
+                    audio_data, overflow = stream.read(block_size)
+                    overflowed = overflowed or overflow
+                    chunk = bytes(audio_data)
+                    audio_chunks.append(chunk)
+                    samples = struct.unpack(f"<{len(chunk)//2}h", chunk)
+                    level = math.sqrt(sum(v*v for v in samples) / max(1, len(samples))) / 32768
+                    percent = min(100, round(level * 500))
+                    self.root.after(0, lambda n=percent: self.active_speech_button.config(text=f"■ 停止 ({n}%)")
+                                    if self.active_speech_button and self.active_speech_button.winfo_exists() else None)
 
             if not audio_chunks:
                 raise RuntimeError("沒有錄到音訊，請確認麥克風後再試一次。")
@@ -1365,15 +1709,25 @@ catch {
                 wav_file.setframerate(sample_rate)
                 wav_file.writeframes(b"".join(audio_chunks))
 
-            transcription = self.transcribe_cloud_audio(
-                provider, api_key, audio_path, language
-            )
+            self.root.after(0, lambda: self.active_speech_button.config(state=tk.DISABLED, text="辨識中…")
+                            if self.active_speech_button and self.active_speech_button.winfo_exists() else None)
+            if overflowed:
+                raise RuntimeError("錄音發生資料遺失，可能影響辨識。請關閉其他占用 CPU 的程式後重試。")
+            raw = b"".join(audio_chunks)
+            values = struct.unpack(f"<{len(raw)//2}h", raw)
+            rms = math.sqrt(sum(v*v for v in values) / max(1, len(values))) / 32768
+            if rms < 0.002:
+                raise RuntimeError("錄音音量太小。請在偏好設定選擇正確麥克風，並調高 Windows 輸入音量。")
+            if provider == "Whisper":
+                transcription = local_whisper.transcribe(audio_path, language)
+            else:
+                transcription = self.transcribe_cloud_audio(provider, api_key, audio_path, language)
             if not transcription:
                 raise RuntimeError("雲端服務沒有辨識出文字，請再試一次。")
             self.root.after(
                 0, lambda text=transcription: self.finish_speech_input(text, None)
             )
-        except (sounddevice.PortAudioError, OSError, RuntimeError, wave.Error) as error:
+        except (sounddevice.PortAudioError, OSError, RuntimeError, wave.Error, subprocess.SubprocessError) as error:
             self.root.after(
                 0,
                 lambda message=str(error): self.finish_speech_input(None, message),
@@ -1497,8 +1851,7 @@ catch {
         if error:
             messagebox.showerror(
                 "語音辨識失敗",
-                f"{error}\n\n請確認已安裝對應語言的 Windows 語音辨識功能，"
-                "並允許應用程式使用麥克風。",
+                f"{error}\n\n請確認麥克風選擇與 Windows 輸入音量；辨識文字可先修改再送出。",
                 parent=(
                     self.practice_window
                     if button is not self.speech_btn
@@ -1531,7 +1884,7 @@ catch {
         save_dir = self.output_dir_var.get().strip()
         scenario = self.scenario_combo.get()
 
-        if not api_key:
+        if provider != "Ollama" and not api_key:
             messagebox.showwarning("提示", f"請輸入有效的 {provider} API Key！")
             return
         if not topic or not keywords:
@@ -1544,6 +1897,7 @@ catch {
         words = ", ".join(keywords)
 
         # 自動記憶並儲存 API Key 至本機 config.json
+        self.config["article_length"] = self.article_length_var.get()
         self.save_config(api_key)
         voice_code = self.voice_var.get().split()[0]
 
@@ -1552,16 +1906,18 @@ catch {
 
         threading.Thread(
             target=self.run_process,
-            args=(provider, api_key, topic, words, save_dir, scenario, voice_code),
+            args=(provider, api_key, topic, words, save_dir, scenario, voice_code, SPEECH_RATES[self.speech_rate_var.get()], self.article_length_var.get()),
             daemon=True
         ).start()
 
-    def run_process(self, provider, api_key, topic, words, save_dir, scenario, voice_code):
+    def run_process(self, provider, api_key, topic, words, save_dir, scenario, voice_code, speech_rate=0, article_length=DEFAULT_ARTICLE_LENGTH):
         try:
             safe_topic = "".join([c if c.isalnum() or c in (' ', '_', '-') else '_' for c in topic]).strip().replace(" ", "_")
 
             self.logger.log(f"► [1/4] 正在使用 {provider} 生成結構化學習卡內容...")
-            content_json = self.call_ai_api(provider, api_key, topic, words, scenario)
+            content_json = self.call_ai_api(provider, api_key, topic, words, scenario, article_length)
+            word_count = len(re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", " ".join(content_json["article"]["en"])))
+            self.logger.log(f"文章長度：{article_length}；實際英文單字數：{word_count}")
             card_keywords = [
                 item["word"].strip()
                 for item in content_json.get("words", [])
@@ -1576,7 +1932,16 @@ catch {
             )
 
             self.logger.log("► [3/4] 正在生成文章語音朗讀檔...")
-            mp3_path = self.generate_audio(content_json, save_dir, safe_topic, voice_code)
+            if provider == "Ollama":
+                try:
+                    mp3_path = self.generate_windows_audio(
+                        " ".join(content_json["article"]["en"]), save_dir, safe_topic,
+                        voice_code, RuntimeError("本機模式使用 Windows 語音"), speech_rate)
+                except (OSError, RuntimeError) as voice_error:
+                    mp3_path = ""
+                    self.logger.log(f"本機朗讀無法使用：{voice_error}；教材已保留，可繼續文字對話。")
+            else:
+                mp3_path = self.generate_audio(content_json, save_dir, safe_topic, voice_code, speech_rate)
 
             self.logger.log("\n✅ [4/4] 全部任務完成！")
             self.logger.log(f"📄 Word 檔儲存於: {docx_path}")
@@ -1636,7 +2001,7 @@ catch {
         )
         self.pause_audio_btn.config(state=tk.DISABLED)
         self.stop_audio_btn.config(state=tk.DISABLED)
-        self.audio_status_var.set(os.path.basename(audio_path))
+        self.audio_status_var.set(os.path.basename(audio_path) if audio_path else "未產生音檔；可繼續使用教材與文字對話")
         self.practice_context = {
             "content": content_json,
             "topic": topic,
@@ -1674,6 +2039,9 @@ catch {
         article = content.get("article", {})
         english_paragraphs = article.get("en", []) if isinstance(article, dict) else []
         chinese_paragraphs = article.get("zh", []) if isinstance(article, dict) else []
+        self.read_along_text = "\n".join(x for x in english_paragraphs if isinstance(x, str))
+        self.read_along_ranges = []
+        self.read_along_active = -1
         preview.insert(tk.END, "雙語文章\n", "preview-subtitle")
         for index, english in enumerate(english_paragraphs):
             if isinstance(english, str):
@@ -1769,6 +2137,15 @@ catch {
                             lines.append("    ".join(cells))
                     lines.append("")
             preview_text = "\n".join(lines).strip()
+            imported_english = []
+            for table in document.tables:
+                if table.rows and table.rows[0].cells[0].text.strip().lower() == "english":
+                    imported_english = [row.cells[0].text.strip() for row in table.rows[1:] if row.cells[0].text.strip()]
+                    break
+            if not imported_english:
+                imported_english = [paragraph.text.strip() for paragraph in document.paragraphs
+                                    if len(re.findall(r"[A-Za-z]+", paragraph.text)) >= 2
+                                    and not re.search(r"[\u3400-\u9fff]", paragraph.text)]
             if not preview_text:
                 raise ValueError("這份 Word 檔沒有可預覽的文字內容。")
         except (
@@ -1788,6 +2165,9 @@ catch {
 
         self.stop_generated_audio(update_status=False)
         self.generated_docx_path = card_path
+        self.read_along_text = "\n".join(imported_english)
+        self.read_along_ranges = []
+        self.read_along_active = -1
         self.open_card_btn.config(state=tk.NORMAL)
         self.preview_title_var.set(os.path.basename(card_path))
         preview = self.card_preview_text
@@ -1796,6 +2176,21 @@ catch {
         preview.insert(tk.END, preview_text)
         preview.configure(state=tk.DISABLED)
         preview.yview_moveto(0)
+        # Importing a card must replace the old conversation context, not just its preview.
+        provider = self.provider_combo.get()
+        self.practice_context = {
+            "content": {"title": os.path.splitext(os.path.basename(card_path))[0],
+                        "words": [], "source_text": preview_text[:12000]},
+            "topic": os.path.splitext(os.path.basename(card_path))[0],
+            "scenario": "匯入學習卡內容",
+            "keywords": [],
+            "provider": provider,
+            "api_key": "" if provider == "Ollama" else (
+                self.api_key_entry.get().strip() or self.get_provider_api_key(provider)
+            ),
+        }
+        self.practice_btn.config(state=tk.NORMAL)
+        self.tools_menu.entryconfig(self.practice_menu_index, state=tk.NORMAL)
 
         base_path = card_path[:-len("_Flashcard.docx")] if card_path.lower().endswith(
             "_flashcard.docx"
@@ -1845,7 +2240,7 @@ catch {
         self.play_audio_btn.config(state=tk.NORMAL)
         self.pause_audio_btn.config(state=tk.DISABLED)
         self.stop_audio_btn.config(state=tk.DISABLED)
-        self.audio_status_var.set(os.path.basename(audio_path))
+        self.audio_status_var.set(os.path.basename(audio_path) if audio_path else "未產生音檔；可繼續使用教材與文字對話")
 
     def open_generated_card(self):
         if not self.generated_docx_path or not os.path.isfile(
@@ -1900,16 +2295,22 @@ catch {
             )
             self.audio_mci.mciGetErrorStringW.restype = ctypes.c_int
             self.audio_device_alias = f"learning_{uuid.uuid4().hex}"
-            audio_type = (
-                "waveaudio"
-                if self.generated_audio_path.lower().endswith(".wav")
-                else "mpegvideo"
-            )
+            # The MPEGVideo device supports speed changes for both MP3 and WAV.
+            audio_type = "mpegvideo"
             self.send_audio_command(
                 f'open "{self.generated_audio_path}" '
                 f"type {audio_type} alias {self.audio_device_alias}"
             )
+            self.send_audio_command(f"set {self.audio_device_alias} time format milliseconds")
+            self.audio_duration_ms = int(self.send_audio_command(
+                f"status {self.audio_device_alias} length", return_output=True
+            ))
+            self.audio_speed_factor = 1.0
+            self.audio_progress.configure(maximum=max(1, self.audio_duration_ms))
+            self.prepare_read_along()
+            self.update_audio_progress(0)
             self.send_audio_command(f"play {self.audio_device_alias}")
+            self.change_playback_rate()
         except (OSError, RuntimeError) as error:
             self.close_generated_audio_device()
             messagebox.showerror("播放失敗", f"無法播放語音檔：\n{error}")
@@ -1918,11 +2319,82 @@ catch {
 
         self.play_audio_btn.config(state=tk.DISABLED)
         self.pause_audio_btn.config(
-            state=tk.NORMAL, text="⏸ 暫停", command=self.pause_generated_audio
+            state=tk.DISABLED if self.audio_rate_pending else tk.NORMAL,
+            text="⏸ 暫停", command=self.pause_generated_audio
         )
         self.stop_audio_btn.config(state=tk.NORMAL)
         self.audio_status_var.set("正在播放...")
-        self.audio_poll_id = self.root.after(500, self.poll_generated_audio)
+        self.audio_poll_id = self.root.after(200, self.poll_generated_audio)
+
+    def change_playback_rate(self, event=None):
+        if not self.audio_device_alias or not self.audio_mci:
+            return
+        factor = 1 + SPEECH_RATES[self.playback_rate_var.get()] / 100
+        if factor == self.audio_speed_factor and not self.audio_rate_pending:
+            return
+        try:
+            position = int(self.send_audio_command(f"status {self.audio_device_alias} position", True)) * self.audio_speed_factor
+            mode = self.send_audio_command(f"status {self.audio_device_alias} mode", True)
+            if not self.audio_rate_pending:
+                self.audio_rate_resume_mode = mode
+            self.send_audio_command(f"pause {self.audio_device_alias}")
+        except RuntimeError as error:
+            messagebox.showerror("無法調整播放速度", str(error))
+            return
+        self.audio_rate_token += 1
+        token = self.audio_rate_token
+        alias = self.audio_device_alias
+        source = self.generated_audio_path
+        if self.audio_tempo_cache is None:
+            self.audio_tempo_cache = AudioTempoCache()
+        self.audio_rate_pending = True
+        self.pause_audio_btn.config(state=tk.DISABLED)
+        self.audio_status_var.set("正在處理變速（保留音調）…")
+        def worker():
+            path, error = None, None
+            try:
+                path = self.audio_tempo_cache.render(source, factor)
+            except Exception as exc:
+                error = str(exc)
+            try:
+                self.root.after(0, lambda: self.finish_playback_rate(token, alias, path, factor, position, error))
+            except RuntimeError:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_playback_rate(self, token, old_alias, path, factor, position, error):
+        if token != self.audio_rate_token or old_alias != self.audio_device_alias:
+            return
+        self.audio_rate_pending = False
+        paused = self.audio_rate_resume_mode == "paused"
+        if error:
+            for label, value in SPEECH_RATES.items():
+                if 1 + value / 100 == self.audio_speed_factor:
+                    self.playback_rate_var.set(label)
+            self.pause_audio_btn.config(state=tk.NORMAL)
+            if not paused:
+                self.resume_generated_audio()
+            self.audio_status_var.set("變速未套用，保留原播放速度")
+            messagebox.showerror("無法調整播放速度", error)
+            return
+        try:
+            self.send_audio_command(f"close {old_alias}")
+            self.audio_device_alias = f"learning_{uuid.uuid4().hex}"
+            alias = self.audio_device_alias
+            self.send_audio_command(f'open "{path}" type mpegvideo alias {alias}')
+            self.send_audio_command(f"set {alias} time format milliseconds")
+            length = int(self.send_audio_command(f"status {alias} length", True))
+            self.audio_speed_factor = factor
+            start = max(0, min(round(position / factor), max(0, length - 1)))
+            self.send_audio_command(f"play {alias} from {start}")
+            self.pause_audio_btn.config(state=tk.NORMAL, text="⏸ 暫停", command=self.pause_generated_audio)
+            if paused:
+                self.pause_generated_audio()
+            else:
+                self.audio_status_var.set(f"正在播放（{self.playback_rate_var.get()}，保留音調）")
+        except RuntimeError as exc:
+            self.stop_generated_audio()
+            messagebox.showerror("播放失敗", str(exc))
 
     def pause_generated_audio(self):
         if not self.audio_device_alias:
@@ -1950,6 +2422,69 @@ catch {
         )
         self.audio_status_var.set("正在播放...")
 
+    @staticmethod
+    def format_audio_time(milliseconds):
+        seconds = max(0, int(milliseconds)) // 1000
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    def clear_read_along(self):
+        self.card_preview_text.tag_remove("read-along", "1.0", tk.END)
+        self.read_along_active = -1
+
+    def toggle_read_along(self):
+        self.clear_read_along()
+        if self.read_along_var.get() and self.audio_device_alias:
+            self.highlight_read_along(self.audio_progress_var.get())
+
+    def prepare_read_along(self):
+        self.clear_read_along()
+        self.read_along_ranges = []
+        segments = read_along.load_timings(self.generated_audio_path, self.audio_duration_ms)
+        exact = segments is not None
+        if segments is None:
+            segments = read_along.estimate_timings(self.read_along_text, self.audio_duration_ms)
+        cursor = "1.0"
+        for item in segments:
+            pattern = r"\s+".join(re.escape(word) for word in item["text"].split())
+            count = tk.IntVar()
+            begin = self.card_preview_text.search(pattern, cursor, stopindex=tk.END, regexp=True, count=count)
+            if not begin:
+                continue
+            end = self.card_preview_text.index(f"{begin}+{count.get()}c")
+            self.read_along_ranges.append({**item, "begin": begin, "end": end})
+            cursor = end
+        if not self.read_along_ranges:
+            mode = "跟讀：無可對應的英文文章"
+        elif exact:
+            mode = "跟讀：句子時間點" + ("（部分句子）" if len(self.read_along_ranges) != len(segments) else "")
+        else:
+            mode = "跟讀：估算（舊音檔無時間資料）"
+        self.read_along_mode_var.set(mode)
+
+    def highlight_read_along(self, position_ms):
+        if not self.read_along_var.get():
+            return
+        active = next((i for i, item in enumerate(self.read_along_ranges)
+                       if item["start_ms"] <= position_ms < item["end_ms"]), -1)
+        if active == self.read_along_active:
+            return
+        self.clear_read_along()
+        if active >= 0:
+            item = self.read_along_ranges[active]
+            self.card_preview_text.tag_add("read-along", item["begin"], item["end"])
+            self.card_preview_text.tag_raise("read-along")
+            self.card_preview_text.see(item["begin"])
+            self.read_along_active = active
+
+    def update_audio_progress(self, position_ms):
+        duration = self.audio_duration_ms
+        position = max(0, min(int(position_ms), duration))
+        self.audio_progress_var.set(position)
+        self.highlight_read_along(position)
+        self.audio_time_var.set(
+            f"{self.format_audio_time(position)} / {self.format_audio_time(duration)}"
+        )
+
     def poll_generated_audio(self):
         self.audio_poll_id = None
         if not self.audio_device_alias:
@@ -1958,6 +2493,10 @@ catch {
             mode = self.send_audio_command(
                 f"status {self.audio_device_alias} mode", return_output=True
             )
+            position = int(self.send_audio_command(
+                f"status {self.audio_device_alias} position", return_output=True
+            ))
+            self.update_audio_progress(position * self.audio_speed_factor)
         except RuntimeError as error:
             self.close_generated_audio_device()
             self.audio_status_var.set("播放失敗")
@@ -1967,6 +2506,7 @@ catch {
             messagebox.showerror("播放失敗", str(error))
             return
         if mode == "stopped":
+            self.update_audio_progress(self.audio_duration_ms)
             self.close_generated_audio_device()
             self.audio_status_var.set("播放完成")
             self.play_audio_btn.config(state=tk.NORMAL)
@@ -1975,7 +2515,7 @@ catch {
             )
             self.stop_audio_btn.config(state=tk.DISABLED)
             return
-        self.audio_poll_id = self.root.after(500, self.poll_generated_audio)
+        self.audio_poll_id = self.root.after(200, self.poll_generated_audio)
 
     def close_generated_audio_device(self):
         if self.audio_poll_id:
@@ -1990,6 +2530,8 @@ catch {
         self.audio_mci = None
 
     def stop_generated_audio(self, update_status=True):
+        self.audio_rate_token = getattr(self, "audio_rate_token", 0) + 1
+        self.audio_rate_pending = False
         if self.audio_device_alias and self.audio_mci:
             try:
                 self.send_audio_command(f"stop {self.audio_device_alias}")
@@ -2012,6 +2554,16 @@ catch {
                 state=tk.DISABLED, text="⏸ 暫停", command=self.pause_generated_audio
             )
             self.stop_audio_btn.config(state=tk.DISABLED)
+        if hasattr(self, "audio_progress_var"):
+            if not update_status:
+                self.audio_duration_ms = 0
+                self.audio_progress.configure(maximum=1)
+            self.update_audio_progress(0)
+        if hasattr(self, "read_along_ranges"):
+            self.clear_read_along()
+            if not update_status:
+                self.read_along_ranges = []
+                self.read_along_mode_var.set("跟讀：播放後顯示")
         if update_status and hasattr(self, "audio_status_var"):
             self.audio_status_var.set("已停止")
 
@@ -2157,6 +2709,7 @@ catch {
                 "scenario": self.practice_context["scenario"],
                 "keywords": self.practice_context["keywords"],
                 "words": target_words,
+                "source_text": content.get("source_text", ""),
                 "provider": self.practice_context["provider"],
             },
             "messages": [],
@@ -2381,7 +2934,7 @@ catch {
         api_key = self.unsaved_api_keys.get(provider) or self.get_provider_api_key(provider)
         if provider == self.provider_combo.get() and self.api_key_entry.get().strip():
             api_key = self.api_key_entry.get().strip()
-        if not api_key:
+        if provider != "Ollama" and not api_key:
             messagebox.showwarning(
                 "缺少 API Key",
                 f"此對話使用 {provider}。請先設定有效的 API Key，再接續對話。",
@@ -2392,6 +2945,8 @@ catch {
             "content": {
                 "title": context.get("title", ""),
                 "words": context.get("words", []),
+                "source_text": context.get("source_text", "")
+                    if isinstance(context.get("source_text", ""), str) else "",
             },
             "topic": context.get("topic", ""),
             "scenario": context.get("scenario", ""),
@@ -2414,7 +2969,10 @@ catch {
             if not self.restore_practice_context(history_record):
                 return
         elif not self.practice_context:
-            messagebox.showwarning("提示", "請先成功生成一份學習卡，再開始對話練習。")
+            messagebox.showwarning("提示", "請先生成或匯入一份學習卡，再開始對話練習。")
+            return
+        if self.practice_context["provider"] != "Ollama" and not self.practice_context["api_key"]:
+            messagebox.showwarning("缺少 API Key", "請先設定所選雲端服務的 API Key，或選擇 Ollama 後重新匯入教材。")
             return
         if self.practice_window and self.practice_window.winfo_exists():
             self.close_practice_window()
@@ -2448,7 +3006,7 @@ catch {
             practice_header,
             text=(
                 f"主題：{self.practice_context['topic']}　"
-                f"情境：{self.practice_context['scenario']}"
+                f"情境：{self.practice_context['scenario']}　服務：{self.practice_context['provider']}"
             ),
             bg=APP_COLORS["navy"],
             fg="#FFFFFF",
@@ -2593,6 +3151,7 @@ catch {
                 "topic": context["topic"],
                 "scenario": context["scenario"],
                 "target_words": words,
+                "imported_card_text": content.get("source_text", ""),
             },
             ensure_ascii=False,
         )
@@ -2678,7 +3237,7 @@ catch {
                 self.practice_entry.config(state=tk.DISABLED)
                 threading.Thread(
                     target=self.run_practice_speech,
-                    args=(token, window, speech_text, voice_code),
+                    args=(token, window, speech_text, voice_code, SPEECH_RATES[self.speech_rate_var.get()], self.practice_context["provider"] == "Ollama"),
                     daemon=True,
                 ).start()
                 return
@@ -2686,34 +3245,32 @@ catch {
         self.practice_entry.config(state=tk.NORMAL)
         self.practice_entry.focus_set()
 
-    def run_practice_speech(self, token, window, text, voice_code):
+    def run_practice_speech(self, token, window, text, voice_code, speech_rate=0, local=False):
         audio_path = None
+        error = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as audio_file:
-                audio_path = audio_file.name
-
-            async def synthesize():
-                communicate = edge_tts.Communicate(text, voice_code)
-                await communicate.save(audio_path)
-
-            asyncio.run(synthesize())
-            if os.path.getsize(audio_path) == 0:
-                raise RuntimeError("Edge TTS 沒有產生有效的語音回覆。")
+            if local:
+                audio_path = self.generate_windows_audio(
+                    text, tempfile.gettempdir(), "aiept_reply_" + uuid.uuid4().hex,
+                    voice_code, RuntimeError("本機模式使用 Windows 語音"), speech_rate)
+            else:
+                et = _get_edge_tts()
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as audio_file:
+                    audio_path = audio_file.name
+                async def synthesize():
+                    communicate = et.Communicate(text, voice_code, rate=f"{speech_rate:+d}%")
+                    await communicate.save(audio_path)
+                asyncio.run(synthesize())
+            if not audio_path or os.path.getsize(audio_path) == 0:
+                raise RuntimeError("沒有產生有效的語音回覆。")
             self.play_practice_audio(audio_path)
-            error = None
-        except (
-            edge_tts.exceptions.EdgeTTSException,
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            OSError,
-            RuntimeError,
-            ctypes.ArgumentError,
-        ) as speech_error:
-            error = f"語音回覆失敗：{speech_error}"
+        except Exception as speech_error:
+            error = f"語音回覆失敗（可繼續文字對話）：{speech_error}"
         finally:
             if audio_path and os.path.exists(audio_path):
                 try:
                     os.remove(audio_path)
+                    read_along.sidecar_path(audio_path).unlink(missing_ok=True)
                 except OSError as cleanup_error:
                     self.logger.log(f"清理語音回覆暫存檔失敗：{cleanup_error}")
         self.root.after(
@@ -2785,80 +3342,122 @@ catch {
         self.practice_entry.focus_set()
 
     def call_chat_api(self, provider, api_key, system_prompt, messages):
-        if provider == "OpenAI":
-            response = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [{"role": "system", "content": system_prompt}, *messages],
-                    "temperature": 0.6,
-                },
-                timeout=90,
-            )
-            response_data = self.parse_chat_response(response, provider)
-            try:
-                return response_data["choices"][0]["message"]["content"].strip()
-            except (KeyError, IndexError, TypeError, AttributeError) as error:
-                raise RuntimeError(f"{provider} 回傳內容格式不正確：{error}") from error
-
-        if provider == "Claude":
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-5-5",
-                    "max_tokens": 1024,
-                    "system": system_prompt,
-                    "messages": messages,
-                },
-                timeout=90,
-            )
-            response_data = self.parse_chat_response(response, provider)
-            try:
-                return "".join(
-                    block["text"]
-                    for block in response_data["content"]
-                    if block.get("type") == "text"
-                ).strip()
-            except (KeyError, TypeError) as error:
-                raise RuntimeError(f"{provider} 回傳內容格式不正確：{error}") from error
-
+        if provider == "Ollama":
+            return self.call_ollama([{"role": "system", "content": system_prompt}, *messages])
+        if not api_key:
+            raise ValueError(f"{provider} 需要 API Key。")
         if provider == "Gemini":
-            contents = [
-                {
-                    "role": "model" if item["role"] == "assistant" else "user",
-                    "parts": [{"text": item["content"]}],
-                }
-                for item in messages
-            ]
-            response = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{GEMINI_MODEL}:generateContent",
-                params={"key": api_key},
-                headers={"Content-Type": "application/json"},
-                json={
-                    "systemInstruction": {"parts": [{"text": system_prompt}]},
-                    "contents": contents,
-                    "generationConfig": {"temperature": 0.6},
-                },
-                timeout=90,
-            )
-            response_data = self.parse_chat_response(response, provider)
-            try:
-                return "".join(
-                    part["text"]
-                    for part in response_data["candidates"][0]["content"]["parts"]
-                    if "text" in part
-                ).strip()
-            except (KeyError, IndexError, TypeError) as error:
-                raise RuntimeError(f"{provider} 回傳內容格式不正確：{error}") from error
+            return self._call_gemini_chat(api_key, system_prompt, messages)
+        if provider == "Claude":
+            return self._call_claude_chat(api_key, system_prompt, messages)
+        if provider == "Cohere":
+            return self._call_cohere_chat(api_key, system_prompt, messages)
+        return self._call_openai_chat(provider, api_key, system_prompt, messages)
 
-        raise ValueError(f"不支援的 AI 服務：{provider}")
+    def _call_gemini_chat(self, api_key, system_prompt, messages):
+        contents = [
+            {
+                "role": "model" if item["role"] == "assistant" else "user",
+                "parts": [{"text": item["content"]}],
+            }
+            for item in messages
+        ]
+        response = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent",
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json={
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": contents,
+                "generationConfig": {"temperature": 0.6},
+            },
+            timeout=90,
+        )
+        response_data = self.parse_chat_response(response, "Gemini")
+        try:
+            return "".join(
+                part["text"]
+                for part in response_data["candidates"][0]["content"]["parts"]
+                if "text" in part
+            ).strip()
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError(f"Gemini 回傳內容格式不正確：{error}") from error
+
+    def _call_claude_chat(self, api_key, system_prompt, messages):
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-5-5",
+                "max_tokens": 1024,
+                "system": system_prompt,
+                "messages": messages,
+            },
+            timeout=90,
+        )
+        response_data = self.parse_chat_response(response, "Claude")
+        try:
+            return "".join(
+                block["text"]
+                for block in response_data["content"]
+                if block.get("type") == "text"
+            ).strip()
+        except (KeyError, TypeError) as error:
+            raise RuntimeError(f"Claude 回傳內容格式不正確：{error}") from error
+
+    def _call_openai_chat(self, provider, api_key, system_prompt, messages):
+        """OpenAI 相容格式的對話 API（OpenAI、HuggingFace、Together、Groq、OpenRouter）"""
+        urls = {
+            "OpenAI": "https://api.openai.com/v1/chat/completions",
+            "HuggingFace": "https://api-inference.huggingface.co/v1/chat/completions",
+            "Together": "https://api.together.xyz/v1/chat/completions",
+            "Groq": "https://api.groq.com/openai/v1/chat/completions",
+            "OpenRouter": "https://openrouter.ai/api/v1/chat/completions",
+        }
+        url = urls.get(provider)
+        if not url:
+            raise ValueError(f"不支援的 AI 服務：{provider}")
+
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": PROVIDER_MODELS.get(provider, "gpt-4o-mini"),
+                "messages": [{"role": "system", "content": system_prompt}, *messages],
+                "temperature": 0.6,
+            },
+            timeout=90,
+        )
+        response_data = self.parse_chat_response(response, provider)
+        try:
+            return response_data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, TypeError, AttributeError) as error:
+            raise RuntimeError(f"{provider} 回傳內容格式不正確：{error}") from error
+
+    def _call_cohere_chat(self, api_key, system_prompt, messages):
+        response = requests.post(
+            "https://api.cohere.com/v1/chat",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": PROVIDER_MODELS["Cohere"],
+                "message": messages[-1]["content"] if messages else "",
+                "temperature": 0.6,
+            },
+            timeout=90,
+        )
+        response_data = self.parse_chat_response(response, "Cohere")
+        try:
+            return response_data.get("text", "").strip()
+        except (KeyError, TypeError) as error:
+            raise RuntimeError(f"Cohere 回傳內容格式不正確：{error}") from error
 
     @staticmethod
     def parse_chat_response(response, provider):
@@ -2876,12 +3475,90 @@ catch {
         except ValueError as error:
             raise RuntimeError(f"{provider} 回傳的內容不是有效 JSON。") from error
 
-    def call_ai_api(self, provider, api_key, topic, words, scenario):
+    def call_ai_api(self, provider, api_key, topic, words, scenario, article_length=DEFAULT_ARTICLE_LENGTH):
         keywords = parse_target_keywords(words)
-        prompt = build_learning_prompt(topic, keywords, scenario)
+        prompt = build_learning_prompt(topic, keywords, scenario, article_length)
+        if provider == "Ollama":
+            tokens = ARTICLE_LENGTHS.get(article_length, ARTICLE_LENGTHS[DEFAULT_ARTICLE_LENGTH])[3]
+            text = self.call_ollama([{"role": "user", "content": prompt}], structured=True, output_tokens=tokens)
+            result = parse_ai_json(text, "Ollama / " + OLLAMA_MODEL)
+            validate_local_card(result, len(keywords))
+            return result
+        if not api_key:
+            raise ValueError(f"{provider} 需要 API Key。")
         if provider == "Gemini":
-            return self.call_gemini_api(api_key, topic, words, scenario)
+            return self.call_gemini_api(api_key, topic, words, scenario, article_length)
+        return self._call_openai_style_api(provider, api_key, prompt)
 
+    def on_service_mode_change(self, event=None):
+        mode = self.service_mode_var.get()
+        self.provider_combo.configure(values=SERVICE_GROUPS[mode])
+        self.provider_combo.set(SERVICE_GROUPS[mode][0])
+        self.on_provider_change()
+        self.service_note.configure(text=SERVICE_NOTES[mode])
+        self.ollama_check_button.configure(state="normal" if self.current_provider == "Ollama" else "disabled")
+
+    def call_ollama(self, messages, structured=False, output_tokens=6144):
+        payload = {
+            "model": OLLAMA_MODEL, "messages": messages, "stream": False, "think": False,
+            "options": {"temperature": 0.2 if structured else 0.6,
+                        "num_ctx": max(8192, output_tokens + 4096) if structured else 8192,
+                        "num_predict": output_tokens if structured else 1024},
+        }
+        if structured:
+            payload["format"] = LOCAL_CARD_SCHEMA
+        try:
+            # A local-only endpoint: never use proxy settings or follow redirects to a cloud host.
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.post(OLLAMA_URL + "/api/chat", json=payload,
+                                        timeout=(5, 600), allow_redirects=False)
+            if response.status_code == 404:
+                raise RuntimeError("找不到 Qwen3 4B。請在終端機執行：ollama pull qwen3:4b")
+            if response.status_code != 200:
+                raise RuntimeError(f"Ollama 回應 HTTP {response.status_code}；請查看 Ollama 日誌。本程式不會切換雲端。")
+            data = response.json()
+            if data.get("error"):
+                raise RuntimeError(f"Ollama 錯誤：{data['error']}")
+            text = data["message"]["content"]
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("empty response")
+            if data.get("done_reason") == "length":
+                raise RuntimeError("本機模型已用盡此次回覆的長度額度，教材尚未完成。這不是關鍵字數量限制；可分批生成，或縮短每個關鍵字的內容。")
+            return text.strip()
+        except requests.Timeout as error:
+            raise RuntimeError("本機模型等候超時（最多 10 分鐘）；請減少關鍵字或關閉其他程式後重試。") from error
+        except requests.RequestException as error:
+            raise RuntimeError("無法連線本機 Ollama。請安裝並啟動 Ollama，再執行 ollama pull qwen3:4b。") from error
+        except (ValueError, KeyError, TypeError) as error:
+            raise RuntimeError("Ollama 回傳格式不正確；請更新 Ollama 並重新下載 qwen3:4b。") from error
+
+    def check_ollama(self):
+        self.ollama_check_button.configure(state="disabled")
+        def worker():
+            try:
+                with requests.Session() as session:
+                    session.trust_env = False
+                    response = session.get(OLLAMA_URL + "/api/tags", timeout=(3, 5), allow_redirects=False)
+                response.raise_for_status()
+                names = {m.get("name") for m in response.json().get("models", [])}
+                if OLLAMA_MODEL in names:
+                    detail = "已連線 Ollama，且已下載 qwen3:4b。可免 API Key 生成教材與對話。"
+                else:
+                    detail = "Ollama 已啟動，但尚未下載模型。請在 PowerShell 執行：\nollama pull qwen3:4b"
+            except (requests.RequestException, ValueError, TypeError, AttributeError):
+                detail = "尚未連上 Ollama。\n1. 從 https://ollama.com/download/windows 安裝並啟動 Ollama。\n2. 在 PowerShell 執行：ollama pull qwen3:4b\n3. 回到程式再次檢查。"
+            def finish():
+                self.ollama_check_button.configure(state="normal" if self.current_provider == "Ollama" else "disabled")
+                messagebox.showinfo("本機模型檢查", detail, parent=self.root)
+            try:
+                self.root.after(0, finish)
+            except RuntimeError:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _call_openai_style_api(self, provider, api_key, prompt):
+        """呼叫 OpenAI 相容格式的 API（OpenAI、HuggingFace、Together、Groq、OpenRouter）"""
         if provider == "OpenAI":
             url = "https://api.openai.com/v1/chat/completions"
             headers = {"Authorization": f"Bearer {api_key}"}
@@ -2904,6 +3581,56 @@ catch {
                 "system": "請遵守使用者指示，只輸出有效 JSON，不要使用 Markdown 程式碼區塊。",
                 "messages": [{"role": "user", "content": prompt}],
             }
+        elif provider == "HuggingFace":
+            url = "https://api-inference.huggingface.co/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            payload = {
+                "model": PROVIDER_MODELS["HuggingFace"],
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+            }
+        elif provider == "Cohere":
+            url = "https://api.cohere.com/v1/chat"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": PROVIDER_MODELS["Cohere"],
+                "message": prompt,
+                "temperature": 0.2,
+            }
+        elif provider == "Together":
+            url = "https://api.together.xyz/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            payload = {
+                "model": PROVIDER_MODELS["Together"],
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+            }
+        elif provider == "Groq":
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            payload = {
+                "model": PROVIDER_MODELS["Groq"],
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+            }
+        elif provider == "OpenRouter":
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": PROVIDER_MODELS["OpenRouter"],
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.2,
+            }
         else:
             raise ValueError(f"不支援的 AI 服務：{provider}")
 
@@ -2913,6 +3640,7 @@ catch {
             )
         except requests.RequestException as error:
             raise RuntimeError(f"{provider} 連線異常：{error}") from error
+
         if response.status_code != 200:
             try:
                 body = response.json()
@@ -2927,21 +3655,18 @@ catch {
 
         try:
             response_data = response.json()
-            if provider == "OpenAI":
-                text = response_data["choices"][0]["message"]["content"]
+            if provider == "Cohere":
+                text = response_data.get("text", "")
             else:
-                text = "".join(
-                    block["text"] for block in response_data["content"]
-                    if block.get("type") == "text"
-                )
+                text = response_data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
             raise RuntimeError(f"{provider} 回傳內容格式不正確：{error}") from error
         return parse_ai_json(text, provider)
 
-    def call_gemini_api(self, api_key, topic, words, scenario="商業"):
+    def call_gemini_api(self, api_key, topic, words, scenario="商業", article_length=DEFAULT_ARTICLE_LENGTH):
         keywords = parse_target_keywords(words)
         candidate_models = [GEMINI_MODEL]
-        prompt = build_learning_prompt(topic, keywords, scenario)
+        prompt = build_learning_prompt(topic, keywords, scenario, article_length)
 
         last_error = None
         url_template = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
@@ -3158,7 +3883,7 @@ catch {
         doc.save(file_path)
         return file_path
 
-    def generate_audio(self, data, save_dir, topic, voice_code):
+    def generate_audio(self, data, save_dir, topic, voice_code, speech_rate=0):
         article_text = " ".join(data['article']['en'])
         if not article_text.strip():
             raise ValueError("文章沒有英文內容，無法生成語音。")
@@ -3167,19 +3892,23 @@ catch {
         with tempfile.NamedTemporaryFile(dir=save_dir, suffix=".mp3", delete=False) as temp_file:
             temp_mp3_path = temp_file.name
 
+        et = _get_edge_tts()
+        EdgeTTSException = et.exceptions.EdgeTTSException
+        NoAudioReceived = et.exceptions.NoAudioReceived
+
         try:
             async def _tts():
-                communicate = edge_tts.Communicate(article_text, voice_code)
+                communicate = et.Communicate(article_text, voice_code, rate=f"{speech_rate:+d}%")
                 await communicate.save(temp_mp3_path)
 
             try:
                 asyncio.run(_tts())
                 if os.path.getsize(temp_mp3_path) == 0:
-                    raise edge_tts.exceptions.NoAudioReceived("Edge TTS returned an empty audio file.")
+                    raise NoAudioReceived("Edge TTS returned an empty audio file.")
                 os.replace(temp_mp3_path, mp3_path)
                 return mp3_path
             except (
-                edge_tts.exceptions.EdgeTTSException,
+                EdgeTTSException,
                 aiohttp.ClientError,
                 asyncio.TimeoutError,
             ) as tts_error:
@@ -3189,14 +3918,14 @@ catch {
                 if os.path.exists(temp_mp3_path):
                     os.remove(temp_mp3_path)
                 return self.generate_windows_audio(
-                    article_text, save_dir, topic, voice_code, tts_error
+                    article_text, save_dir, topic, voice_code, tts_error, speech_rate
                 )
         finally:
             if os.path.exists(temp_mp3_path):
                 os.remove(temp_mp3_path)
 
     def generate_windows_audio(
-        self, article_text, save_dir, topic, voice_code, tts_error
+        self, article_text, save_dir, topic, voice_code, tts_error, speech_rate=0
     ):
         if sys.platform != "win32":
             raise RuntimeError(
@@ -3209,7 +3938,9 @@ catch {
 
         script = """
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding
 $text = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:TOIC_TTS_TEXT))
+$sentences = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:AIEPT_TTS_SENTENCES)))
 $synth = New-Object -ComObject SAPI.SpVoice
 $gender = if ($env:TOIC_TTS_VOICE -match '-(Guy|Ryan)Neural$') { 'Male' } else { 'Female' }
 $language = if ($env:TOIC_TTS_VOICE -like 'en-GB-*') { '809' } else { '409' }
@@ -3225,18 +3956,30 @@ if (-not $voice) {
 }
 if (-not $voice) { throw "No Windows English $gender speech voice is installed." }
 $synth.Voice = $voice
+# SAPI uses -10..10 steps, not percentages; this is an approximate mapping.
+$synth.Rate = [int]$env:TOIC_TTS_RATE
 $stream = New-Object -ComObject SAPI.SpFileStream
 $stream.Open($env:TOIC_TTS_OUTPUT, 3, $false)
 $synth.AudioOutputStream = $stream
-$synth.Speak($text) | Out-Null
+$segments = @()
+foreach ($sentence in @($sentences)) {
+    $start = [double]$stream.Seek(0, 1)
+    $synth.Speak([string]$sentence, 16) | Out-Null
+    $end = [double]$stream.Seek(0, 1)
+    $segments += @{ text = [string]$sentence; start_byte = $start; end_byte = $end }
+}
 $stream.Close()
-[Console]::Out.Write($voice.GetDescription())
+[Console]::Out.Write((@{voice=$voice.GetDescription(); segments=$segments} | ConvertTo-Json -Depth 5 -Compress))
 """
         environment = os.environ.copy()
         environment["TOIC_TTS_TEXT"] = base64.b64encode(
             article_text.encode("utf-8")
         ).decode("ascii")
+        environment["AIEPT_TTS_SENTENCES"] = base64.b64encode(
+            json.dumps(read_along.sentences(article_text), ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
         environment["TOIC_TTS_VOICE"] = voice_code
+        environment["TOIC_TTS_RATE"] = str(max(-10, min(10, round(speech_rate / 10))))
         environment["TOIC_TTS_OUTPUT"] = temp_wav_path
 
         try:
@@ -3251,6 +3994,7 @@ $stream.Close()
                 env=environment,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 timeout=120,
                 check=True,
                 creationflags=subprocess.CREATE_NO_WINDOW
@@ -3258,10 +4002,21 @@ $stream.Close()
             if os.path.getsize(temp_wav_path) <= 44:
                 raise RuntimeError("Windows 語音服務沒有產生有效的 WAV 音訊。")
             os.replace(temp_wav_path, wav_path)
-            voice_name = result.stdout.strip()
+            details = json.loads(result.stdout)
+            with wave.open(wav_path, "rb") as audio:
+                bytes_per_second = audio.getframerate() * audio.getnchannels() * audio.getsampwidth()
+            segments = [{"text": item["text"],
+                         "start_ms": round(item["start_byte"] * 1000 / bytes_per_second),
+                         "end_ms": round(item["end_byte"] * 1000 / bytes_per_second)}
+                        for item in details["segments"]]
+            try:
+                read_along.save_timings(wav_path, segments)
+            except OSError as error:
+                self.logger.log(f"   語音已儲存，但跟讀時間資料無法寫入：{error}")
+            voice_name = details["voice"]
             self.logger.log(f"   已使用 Windows 離線語音: {voice_name}")
             return wav_path
-        except (OSError, subprocess.SubprocessError, RuntimeError) as fallback_error:
+        except (OSError, subprocess.SubprocessError, RuntimeError, ValueError, KeyError) as fallback_error:
             raise RuntimeError(
                 f"Edge TTS 無法產生音訊 ({tts_error})，Windows 離線語音備援也失敗: "
                 f"{fallback_error}"
@@ -3274,4 +4029,5 @@ $stream.Close()
 if __name__ == "__main__":
     root = tk.Tk()
     app = FlashcardApp(root)
+    root.after(2500, app.check_for_updates)
     root.mainloop()

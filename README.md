@@ -13,21 +13,21 @@ python -m pip install -r requirements.txt
 python app.py
 ```
 
-第一次使用時，在程式的「設定 → 偏好設定」設定 API Key。API Key 和對話紀錄存在本機 `config.json`、`chat_history.json`，不應提交到 Git。
+第一次使用預設為 Ollama 本機模式，不需要 API Key；安裝及下載模型步驟見 OLLAMA_GUIDE.md。只有雲端服務需要在「設定 → 偏好設定」設定 API Key。API Key 和對話紀錄存在本機 `config.json`、`chat_history.json`，不應提交到 Git。
 
 ## 建立 Windows 可攜式版本
 
 在專案根目錄執行：
 
 ```powershell
-python -m PyInstaller --noconfirm --clean --onedir --windowed --collect-all sounddevice --icon=app_icon.ico --name "AIEPT" app.py
+python -m PyInstaller --noconfirm --clean AIEPT.spec
 ```
 
 輸出於 `dist\AIEPT\`。請完整提供該資料夾，不要只散發 `AIEPT.exe`。
 
 ## 建立安裝程式
 
-先成功建立並測試 `dist\AIEPT\`，再以 Inno Setup 開啟 `AIEPT.iss` 並編譯。安裝檔會輸出為 `AIEPT_Setup_v2.7.exe`。
+先成功建立並測試 `dist\AIEPT\`，再以 Inno Setup 開啟 `AIEPT.iss` 並編譯。安裝檔會輸出為 `AIEPT_Setup_v2.9.exe`。
 
 ## 專案檔案
 
@@ -45,7 +45,7 @@ python -m PyInstaller --noconfirm --clean --onedir --windowed --collect-all soun
 - API Key 與聊天紀錄只保留在本機。不要將真實金鑰寫進程式、範例、截圖或問題回報。
 - `.venv/`、建置目錄、安裝 EXE、生成教材與音訊均不納入原始碼版本管理。
 - 可攜式版本必須從乾淨的建置輸出產生；散發前確認其中沒有 `config.json`、`chat_history.json`、`.env` 或私人教材與錄音。
-- Inno Setup 設定已排除上述敏感設定及常見私人輸出；這些規則不會修改以前編譯的安裝檔。2026-10-21 已重新編譯並檢查 `AIEPT_Setup_v2.7.exe`；檢查結果見 `INSTALLER_VERIFICATION.md`。後續每次發行仍需重新檢查。
+- Inno Setup 設定已排除上述敏感設定及常見私人輸出；這些規則不會修改以前編譯的安裝檔。2026-10-21 已重新編譯並檢查 `AIEPT_Setup_v2.9.exe`；檢查結果見 `INSTALLER_VERIFICATION.md`。後續每次發行仍需重新檢查。
 - 如金鑰曾公開或隨安裝包提供，請至服務供應商撤銷並重新產生。
 - 公開專案前確認原始碼、圖示及第三方元件的使用權；本專案原始碼採用 MIT License，第三方元件仍依各自授權條款提供。
 
@@ -66,3 +66,39 @@ Copyright (c) 2026 Yu-Tsang Lu.
 本專案原始碼採用 [MIT License](LICENSE)。使用、修改或散布本軟體時，請依授權條款保留版權聲明與授權文字。
 
 第三方套件及隨附元件依各自授權條款提供；AI 與語音服務另依其服務條款使用。
+
+## 朗讀速度
+
+在「設定 → 偏好設定 → 朗讀速度」選擇 0.5、0.75、1.0、1.25 或 1.5 倍並儲存。設定套用至新生成的教材音檔與下一次對話回覆朗讀；既有音檔速度不變。Windows SAPI 備援語音使用近似速度對應。
+
+## 語音播放速度
+
+播放器提供 0.5、0.75、1.0、1.25、1.5 倍速，可在播放或暫停時切換；使用同一音檔，不需要重新產生。偏好設定中的朗讀速度僅影響新生成音檔，播放速度則相對於該音檔調整。
+
+播放器另顯示播放進度與已播放／總長時間，暫停、變速與停止時同步更新。匯入歷史 Word 學習卡後即可開啟對話，不必等音訊播放完成；對話以匯入教材為依據。
+## v2.9.1：文章長度與語音改善
+
+- 主畫面可選擇英文文章目標長度：短篇 100–150 字、中篇 200–300 字、長篇 500–700 字。字數以英文單字計算，生成紀錄會顯示實際字數；模型輸出可能與目標有差異。長文需要更多時間與記憶體。
+- 播放速度使用 FFmpeg 的保留音調處理，不再直接改變播放器的音高。第一次切換速度可能需短暫處理，之後使用暫存版本；原始音檔不會改動。播放時間以原始教材進度顯示。
+- 「設定 → 偏好設定」可選 Whisper 本機辨識、錄音裝置與關鍵字語音語言。英文對話固定使用英文辨識。既有設定若仍是 Windows 本機，可手動改選 Whisper。
+- 首次按「下載／檢查 Whisper」會提示下載約 150 MB，包含 CPU 引擎與中英文 base 模型，並驗證 SHA256。模型保存在 `%LOCALAPPDATA%\AIEPT\whisper`，不需要 API Key。下載後錄音與辨識皆在本機。
+- 錄音時按同一按鈕停止，每段最長約 30 秒；按鈕顯示收音強度，太小聲或錄音資料遺失會提供提示。辨識文字先填入輸入框，可修改後再送出，並非發音評分。
+- 新安裝包為 `AIEPT_Setup_v2.9.1.exe`。第三方元件的授權與來源見 `THIRD_PARTY_NOTICES.md`；AIEPT 原始碼仍採 MIT。
+## v2.9.2：英文句子螢光跟讀
+
+播放器新增「螢光跟讀」開關，以黃色背景標示目前朗讀的英文句子，並自動捲動到該句。暫停時保留標示、停止或播畢時清除，變速後仍依原始音訊時間軸更新。
+
+新產生的 Windows 本機語音會記錄每句實際音訊位置，存成音檔旁的 `*.timings.json`。匯入音檔時，請一併保留這個同名檔案。這份資料含有教材文字，已由 Git 與安裝包排除。
+
+舊音檔或其他沒有時間資料的音訊使用依句長分配的估算跟讀，播放器會明確標示「估算」；停頓或語速不均可能造成偏差。跟讀以學習卡英文文章為範圍，非逐字發音評分。
+
+安裝包：`AIEPT_Setup_v2.9.2.exe`。
+## v2.9.3：軟體更新通知
+
+- 啟動後在背景查詢本專案 GitHub 最新正式 Release，每天最多自動查詢一次；同一新版只自動提醒一次。
+- 可從「說明 → 檢查更新」隨時手動查詢，或在「設定 → 偏好設定」關閉啟動檢查。
+- 只查版本資料，不傳送教材、錄音、對話或 API Key。自動查詢失敗時不跳出打斷視窗，也不影響本機 AI 使用。
+- 有新版時詢問是否開啟官方 GitHub Release 頁面，下載與安裝由使用者決定，不自動執行更新檔。
+- 維護者需在 `ytlu-gif/AIEPTgit` 發布正式 GitHub Release，版本標籤採 `v2.9.3` 這類格式；草稿與預覽版本不通知。僅推送 commit 不會觸發新版通知。
+
+安裝包：`AIEPT_Setup_v2.9.3.exe`。v2.9.2 及更早版本尚無此通知功能，需先安裝這個版本。

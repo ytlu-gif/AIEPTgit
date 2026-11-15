@@ -1,7 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
-datas = []
+datas = collect_data_files('docx') + collect_data_files('imageio_ffmpeg')
+datas += [('THIRD_PARTY_NOTICES.md', '.'), ('licenses', 'licenses')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('sounddevice')
